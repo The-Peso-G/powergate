@@ -23,6 +23,7 @@ import (
 	"github.com/ipfs/go-datastore"
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/textileio/powergate/deals"
+	"github.com/textileio/powergate/ffs"
 	"github.com/textileio/powergate/util"
 )
 
@@ -213,11 +214,11 @@ func (m *Module) GetDealStatus(ctx context.Context, pcid cid.Cid) (storagemarket
 }
 
 // Watch returns a channel with state changes of indicated proposals.
-func (m *Module) Watch(ctx context.Context, proposals []cid.Cid) (<-chan deals.DealInfo, error) {
+func (m *Module) Watch(ctx context.Context, proposals []cid.Cid) (<-chan deals.StorageDealInfo, error) {
 	if len(proposals) == 0 {
 		return nil, fmt.Errorf("proposals list can't be empty")
 	}
-	ch := make(chan deals.DealInfo)
+	ch := make(chan deals.StorageDealInfo)
 	go func() {
 		defer close(ch)
 		currentState := make(map[cid.Cid]*api.DealInfo)
@@ -235,61 +236,125 @@ func (m *Module) Watch(ctx context.Context, proposals []cid.Cid) (<-chan deals.D
 	return ch, nil
 }
 
-// FinalDealRecords returns a list of all finalized storage deals.
-// Records are sorted ascending by activation epoch then timestamp.
-func (m *Module) FinalDealRecords() ([]deals.DealRecord, error) {
-	ret, err := m.store.getFinalDeals()
-	if err != nil {
-		return nil, fmt.Errorf("getting final deals: %v", err)
+// ListStorageDealRecords lists storage deals according to the provided options.
+func (m *Module) ListStorageDealRecords(opts ...ffs.ListDealRecordsOption) ([]deals.StorageDealRecord, error) {
+	c := ffs.ListDealRecordsConfig{}
+	for _, opt := range opts {
+		opt(&c)
 	}
-	return ret, nil
-}
-
-// PendingDealRecords returns a list of all pending storage deals.
-// Records are sorted ascending by timestamp.
-func (m *Module) PendingDealRecords() ([]deals.DealRecord, error) {
-	ret, err := m.store.getPendingDeals()
-	if err != nil {
-		return nil, fmt.Errorf("getting pending deals: %v", err)
-	}
-	return ret, nil
-}
-
-// AllDealRecords returns a list of all finalized and pending deals.
-// Records are sorted ascending by activation epoch, if available, then timestamp.
-func (m *Module) AllDealRecords() ([]deals.DealRecord, error) {
-	ret, err := m.store.getFinalDeals()
-	if err != nil {
-		return nil, fmt.Errorf("getting final deals: %v", err)
-	}
-	pending, err := m.store.getPendingDeals()
-	if err != nil {
-		return nil, fmt.Errorf("getting pending deals: %v", err)
-	}
-	ret = append(ret, pending...)
-	sort.Slice(ret, func(i, j int) bool {
-		if ret[i].Pending || ret[j].Pending {
-			return ret[i].Time < ret[j].Time
+	var final []deals.StorageDealRecord
+	if !c.OnlyPending {
+		recs, err := m.store.getFinalDeals()
+		if err != nil {
+			return nil, fmt.Errorf("getting final deals: %v", err)
 		}
-		if ret[i].DealInfo.ActivationEpoch < ret[j].DealInfo.ActivationEpoch {
+		final = recs
+	}
+
+	var pending []deals.StorageDealRecord
+	if c.IncludePending || c.OnlyPending {
+		recs, err := m.store.getPendingDeals()
+		if err != nil {
+			return nil, fmt.Errorf("getting pending deals: %v", err)
+		}
+		pending = recs
+	}
+
+	combined := append(final, pending...)
+
+	var filtered []deals.StorageDealRecord
+
+	if len(c.FromAddrs) > 0 || len(c.DataCids) > 0 {
+		var fromAddrsFilter map[string]struct{}
+		var dataCidsFilter map[string]struct{}
+		for _, addr := range c.FromAddrs {
+			fromAddrsFilter[addr] = struct{}{}
+		}
+		for _, cid := range c.DataCids {
+			dataCidsFilter[cid] = struct{}{}
+		}
+		for _, record := range combined {
+			_, inFromAddrsFilter := fromAddrsFilter[record.Addr]
+			_, inDataCidsFilter := dataCidsFilter[record.DealInfo.PieceCID.String()]
+			includeViaFromAddrs := len(c.FromAddrs) == 0 || inFromAddrsFilter
+			includeViaDataCids := len(dataCidsFilter) == 0 || inDataCidsFilter
+			if includeViaFromAddrs && includeViaDataCids {
+				filtered = append(filtered, record)
+			}
+		}
+	} else {
+		filtered = combined
+	}
+
+	sort.Slice(filtered, func(i, j int) bool {
+		l := filtered[j]
+		r := filtered[i]
+		if c.Ascending {
+			l = filtered[i]
+			r = filtered[j]
+		}
+		if l.Pending || r.Pending {
+			return l.Time < r.Time
+		}
+		if l.DealInfo.ActivationEpoch < r.DealInfo.ActivationEpoch {
 			return true
 		}
-		if ret[i].DealInfo.ActivationEpoch > ret[j].DealInfo.ActivationEpoch {
+		if l.DealInfo.ActivationEpoch > r.DealInfo.ActivationEpoch {
 			return false
 		}
-		return ret[i].Time < ret[j].Time
+		return l.Time < r.Time
 	})
-	return ret, nil
+
+	return filtered, nil
 }
 
-// RetrievalRecords returns a list of all retrievals.
-// Records are sorted ascending by timestamp.
-func (m *Module) RetrievalRecords() ([]deals.RetrievalRecord, error) {
+// ListRetrievalDealRecords returns a list of retrieval deals
+// according to the provided options.
+func (m *Module) ListRetrievalDealRecords(opts ...ffs.ListDealRecordsOption) ([]deals.RetrievalDealRecord, error) {
+	c := ffs.ListDealRecordsConfig{}
+	for _, opt := range opts {
+		opt(&c)
+	}
 	ret, err := m.store.getRetrievals()
 	if err != nil {
 		return nil, fmt.Errorf("getting retrievals: %v", err)
 	}
-	return ret, nil
+
+	var filtered []deals.RetrievalDealRecord
+
+	if len(c.FromAddrs) > 0 || len(c.DataCids) > 0 {
+		var fromAddrsFilter map[string]struct{}
+		var dataCidsFilter map[string]struct{}
+		for _, addr := range c.FromAddrs {
+			fromAddrsFilter[addr] = struct{}{}
+		}
+		for _, cid := range c.DataCids {
+			dataCidsFilter[cid] = struct{}{}
+		}
+		for _, record := range ret {
+			_, inFromAddrsFilter := fromAddrsFilter[record.Addr]
+			_, inDataCidsFilter := dataCidsFilter[record.DealInfo.PieceCID.String()]
+			includeViaFromAddrs := len(c.FromAddrs) == 0 || inFromAddrsFilter
+			includeViaDataCids := len(dataCidsFilter) == 0 || inDataCidsFilter
+			if includeViaFromAddrs && includeViaDataCids {
+				filtered = append(filtered, record)
+			}
+		}
+	} else {
+		filtered = ret
+	}
+
+	sort.Slice(filtered, func(i, j int) bool {
+		l := filtered[j]
+		r := filtered[i]
+		if c.Ascending {
+			l = filtered[i]
+			r = filtered[j]
+		}
+		return l.Time < r.Time
+	})
+
+	return filtered, nil
 }
 
 func (m *Module) initPendingDeals() {
@@ -309,14 +374,14 @@ func (m *Module) initPendingDeals() {
 }
 
 func (m *Module) recordDeal(params *api.StartDealParams, proposalCid cid.Cid) {
-	di := deals.DealInfo{
+	di := deals.StorageDealInfo{
 		PieceCID:      params.Data.Root,
 		Duration:      params.MinBlocksDuration,
 		PricePerEpoch: params.EpochPrice.Uint64(),
 		Miner:         params.Miner.String(),
 		ProposalCid:   proposalCid,
 	}
-	record := deals.DealRecord{
+	record := deals.StorageDealRecord{
 		Addr:     params.Wallet.String(),
 		Time:     time.Now().Unix(),
 		DealInfo: di,
@@ -330,7 +395,7 @@ func (m *Module) recordDeal(params *api.StartDealParams, proposalCid cid.Cid) {
 	go m.eventuallyFinalizeDeal(record, dealTimeout)
 }
 
-func (m *Module) finalizePendingDeal(dr deals.DealRecord) {
+func (m *Module) finalizePendingDeal(dr deals.StorageDealRecord) {
 	deletePending := func() {
 		if err := m.store.deletePendingDeal(dr.DealInfo.ProposalCid); err != nil {
 			log.Errorf("deleting pending deal for proposal cid %s: %v", dr.DealInfo.ProposalCid.String(), err)
@@ -354,7 +419,7 @@ func (m *Module) finalizePendingDeal(dr deals.DealRecord) {
 			deletePending()
 			return
 		}
-		record := deals.DealRecord{
+		record := deals.StorageDealRecord{
 			Addr:     dr.Addr,
 			Time:     time.Now().Unix(), // Note: This can be much later in time than the deal actually became active on chain
 			DealInfo: di,
@@ -366,7 +431,7 @@ func (m *Module) finalizePendingDeal(dr deals.DealRecord) {
 	}
 }
 
-func (m *Module) eventuallyFinalizeDeal(dr deals.DealRecord, timeout time.Duration) {
+func (m *Module) eventuallyFinalizeDeal(dr deals.StorageDealRecord, timeout time.Duration) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	updates, err := m.Watch(ctx, []cid.Cid{dr.DealInfo.ProposalCid})
@@ -391,7 +456,7 @@ func (m *Module) eventuallyFinalizeDeal(dr deals.DealRecord, timeout time.Durati
 				return
 			}
 			if info.StateID == storagemarket.StorageDealActive {
-				record := deals.DealRecord{
+				record := deals.StorageDealRecord{
 					Addr:     dr.Addr,
 					Time:     time.Now().Unix(),
 					DealInfo: info,
@@ -417,10 +482,10 @@ func (m *Module) eventuallyFinalizeDeal(dr deals.DealRecord, timeout time.Durati
 }
 
 func (m *Module) recordRetrieval(addr string, offer api.QueryOffer) {
-	rr := deals.RetrievalRecord{
+	rr := deals.RetrievalDealRecord{
 		Addr: addr,
 		Time: time.Now().Unix(),
-		RetrievalInfo: deals.RetrievalInfo{
+		DealInfo: deals.RetrievalDealInfo{
 			PieceCID:                offer.Root,
 			Size:                    offer.Size,
 			MinPrice:                offer.MinPrice.Uint64(),
@@ -435,7 +500,7 @@ func (m *Module) recordRetrieval(addr string, offer api.QueryOffer) {
 	}
 }
 
-func notifyChanges(ctx context.Context, client *apistruct.FullNodeStruct, currState map[cid.Cid]*api.DealInfo, proposals []cid.Cid, ch chan<- deals.DealInfo) error {
+func notifyChanges(ctx context.Context, client *apistruct.FullNodeStruct, currState map[cid.Cid]*api.DealInfo, proposals []cid.Cid, ch chan<- deals.StorageDealInfo) error {
 	for _, pcid := range proposals {
 		dinfo, err := client.ClientGetDealInfo(ctx, pcid)
 		if err != nil {
@@ -460,8 +525,8 @@ func notifyChanges(ctx context.Context, client *apistruct.FullNodeStruct, currSt
 	return nil
 }
 
-func fromLotusDealInfo(ctx context.Context, client *apistruct.FullNodeStruct, dinfo *api.DealInfo) (deals.DealInfo, error) {
-	di := deals.DealInfo{
+func fromLotusDealInfo(ctx context.Context, client *apistruct.FullNodeStruct, dinfo *api.DealInfo) (deals.StorageDealInfo, error) {
+	di := deals.StorageDealInfo{
 		ProposalCid:   dinfo.ProposalCid,
 		StateID:       dinfo.State,
 		StateName:     storagemarket.DealStates[dinfo.State],
@@ -476,7 +541,7 @@ func fromLotusDealInfo(ctx context.Context, client *apistruct.FullNodeStruct, di
 	if dinfo.State == storagemarket.StorageDealActive {
 		ocd, err := client.StateMarketStorageDeal(ctx, dinfo.DealID, types.EmptyTSK)
 		if err != nil {
-			return deals.DealInfo{}, fmt.Errorf("getting on-chain deal info: %s", err)
+			return deals.StorageDealInfo{}, fmt.Errorf("getting on-chain deal info: %s", err)
 		}
 		di.ActivationEpoch = int64(ocd.State.SectorStartEpoch)
 		di.StartEpoch = uint64(ocd.Proposal.StartEpoch)
